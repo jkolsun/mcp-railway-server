@@ -33,7 +33,7 @@ app.get('/sse', (req, res) => {
 
   const child = spawn('npx', ['-y', '@railway/mcp-server'], {
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, RAILWAY_TOKEN },
+    env: { ...process.env, RAILWAY_TOKEN, RAILWAY_API_TOKEN: RAILWAY_TOKEN },
   });
 
   let buffer = '';
