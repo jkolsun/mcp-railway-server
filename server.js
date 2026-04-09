@@ -31,9 +31,9 @@ app.get('/sse', (req, res) => {
     'Connection': 'keep-alive',
   });
 
-  const child = spawn('npx', ['-y', '@railway/mcp-server'], {
+  const child = spawn('npx', ['-y', '@jasontanswe/railway-mcp'], {
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, RAILWAY_TOKEN, RAILWAY_API_TOKEN: RAILWAY_TOKEN },
+    env: { ...process.env, RAILWAY_API_TOKEN: RAILWAY_TOKEN },
   });
 
   let buffer = '';
