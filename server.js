@@ -8,6 +8,11 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 8080;
 const RAILWAY_TOKEN = process.env.RAILWAY_TOKEN;
+// Optional — required only for the get-logs tool, which resolves services by
+// name within a single pre-configured project. All other tools take explicit
+// projectId/serviceId/environmentId args and don't need these.
+const RAILWAY_PROJECT_ID = process.env.RAILWAY_PROJECT_ID || null;
+const RAILWAY_ENVIRONMENT_NAME = process.env.RAILWAY_ENVIRONMENT_NAME || 'production';
 
 if (!RAILWAY_TOKEN) {
   console.error('RAILWAY_TOKEN environment variable is required');
@@ -30,6 +35,72 @@ async function railwayQuery(query, variables = {}) {
     console.error('GraphQL errors:', JSON.stringify(data.errors));
   }
   return data;
+}
+
+// Parse a duration like "15m", "30m", "1h", "6h", "24h" into an ISO start date.
+function parseTimeRange(s) {
+  const m = typeof s === 'string' && s.match(/^(\d+)(m|h)$/i);
+  if (!m) {
+    throw new Error(`Invalid time_range "${s}". Examples: "15m", "30m", "1h", "6h", "24h"`);
+  }
+  const n = parseInt(m[1], 10);
+  const unitMs = m[2].toLowerCase() === 'm' ? 60_000 : 3_600_000;
+  return new Date(Date.now() - n * unitMs).toISOString();
+}
+
+// Cache project context for 60s. The list of services rarely changes; this
+// saves one GraphQL round-trip on every get-logs call after the first.
+let projectCache = null;
+let projectCacheAt = 0;
+const PROJECT_CACHE_TTL_MS = 60_000;
+
+async function getProjectContext() {
+  const now = Date.now();
+  if (projectCache && (now - projectCacheAt) < PROJECT_CACHE_TTL_MS) return projectCache;
+  if (!RAILWAY_PROJECT_ID) {
+    throw new Error(
+      'RAILWAY_PROJECT_ID env var is not set. The get-logs tool resolves services by name within a single project — set RAILWAY_PROJECT_ID on the MCP server deployment to the project you want to query.'
+    );
+  }
+  const data = await railwayQuery(
+    `query project($id: String!) { project(id: $id) { id name services { edges { node { id name } } } environments { edges { node { id name } } } } }`,
+    { id: RAILWAY_PROJECT_ID }
+  );
+  if (data.errors) throw new Error(`Railway API error: ${JSON.stringify(data.errors)}`);
+  if (!data?.data?.project) throw new Error(`Project "${RAILWAY_PROJECT_ID}" not found`);
+  const p = data.data.project;
+  const services = p.services?.edges?.map(e => e.node) || [];
+  const environments = p.environments?.edges?.map(e => e.node) || [];
+  const environment =
+    environments.find(e => e.name.toLowerCase() === RAILWAY_ENVIRONMENT_NAME.toLowerCase()) ||
+    environments[0];
+  if (!environment) throw new Error(`No environment found in project "${p.name}"`);
+  projectCache = { project: p, services, environment };
+  projectCacheAt = now;
+  return projectCache;
+}
+
+async function resolveServiceByName(name) {
+  const ctx = await getProjectContext();
+  const svc = ctx.services.find(s => s.name.toLowerCase() === String(name).toLowerCase());
+  if (!svc) {
+    const available = ctx.services.map(s => s.name).join(', ') || '(none)';
+    throw new Error(`Service "${name}" not found in project "${ctx.project.name}". Available: ${available}`);
+  }
+  return { service: svc, environment: ctx.environment };
+}
+
+async function getActiveDeployment(serviceId, environmentId) {
+  const data = await railwayQuery(
+    `query deployments($input: DeploymentListInput!) { deployments(input: $input, first: 5) { edges { node { id status createdAt } } } }`,
+    { input: { serviceId, environmentId } }
+  );
+  if (data.errors) throw new Error(`Railway API error: ${JSON.stringify(data.errors)}`);
+  const deps = data?.data?.deployments?.edges?.map(e => e.node) || [];
+  if (deps.length === 0) throw new Error('Service has no deployments');
+  // Newest first — Railway usually returns that order but sort defensively.
+  deps.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  return deps[0];
 }
 
 const TOOLS = [
@@ -82,6 +153,21 @@ const TOOLS = [
         serviceId: { type: 'string', description: 'Service ID' },
       },
       required: ['projectId', 'environmentId', 'serviceId'],
+    },
+  },
+  {
+    name: 'get-logs',
+    description: 'Pull recent logs for a service by name (e.g. "worker", "bright_engine") without needing a deployment ID. Resolves the current active deployment in the configured RAILWAY_PROJECT_ID + environment, then filters by time range, optional grep substring, and optional lead_id. Use this when investigating a live incident — prefer it over get-deployment-logs.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        service: { type: 'string', description: 'Service name on Railway (case-insensitive, matched exactly).' },
+        time_range: { type: 'string', description: 'How far back to look. Format: "15m", "30m", "1h", "6h", "24h". Default "1h".' },
+        grep: { type: 'string', description: 'Case-insensitive substring filter. Only log lines containing this string are returned.' },
+        lead_id: { type: 'string', description: 'Additional filter ANDed with grep — only lines containing this lead ID are returned. Useful for tracing one lead through the system.' },
+        limit: { type: 'number', description: 'Max lines returned. Default 500, hard cap 2000.' },
+      },
+      required: ['service'],
     },
   },
 ];
@@ -144,6 +230,83 @@ async function handleToolCall(name, args) {
         Object.entries(vars).map(([k, v]) => [k, typeof v === 'string' && v.length > 8 ? v.slice(0, 4) + '****' : v])
       );
       return JSON.stringify(masked, null, 2);
+    }
+    case 'get-logs': {
+      const service = args.service;
+      const time_range = args.time_range || '1h';
+      const grep = args.grep;
+      const lead_id = args.lead_id;
+      const limit = Math.min(Math.max(1, parseInt(args.limit, 10) || 500), 2000);
+
+      if (!service || typeof service !== 'string') {
+        return JSON.stringify({ error: 'service is required' }, null, 2);
+      }
+
+      let startDateIso;
+      try { startDateIso = parseTimeRange(time_range); }
+      catch (e) { return JSON.stringify({ error: e.message }, null, 2); }
+
+      let resolved;
+      try { resolved = await resolveServiceByName(service); }
+      catch (e) { return JSON.stringify({ error: e.message }, null, 2); }
+
+      let deployment;
+      try { deployment = await getActiveDeployment(resolved.service.id, resolved.environment.id); }
+      catch (e) { return JSON.stringify({ error: `Service "${service}" has no active deployment: ${e.message}` }, null, 2); }
+
+      // Fetch a generous window and filter client-side so we don't depend on
+      // server-side time-range args the GraphQL schema may or may not expose.
+      // 5000 is Railway's practical cap for deploymentLogs.
+      const FETCH_LIMIT = 5000;
+      const logData = await railwayQuery(
+        `query deploymentLogs($deploymentId: String!, $limit: Int) { deploymentLogs(deploymentId: $deploymentId, limit: $limit) { timestamp message severity } }`,
+        { deploymentId: deployment.id, limit: FETCH_LIMIT }
+      );
+      if (logData.errors) {
+        const rateLimited = logData.errors.some(e => /rate limit|429|too many requests/i.test(e?.message || ''));
+        if (rateLimited) {
+          return JSON.stringify({ error: 'Railway API rate limit exceeded — back off and retry in a few seconds.' }, null, 2);
+        }
+        return JSON.stringify({ error: `Railway API error: ${JSON.stringify(logData.errors)}` }, null, 2);
+      }
+
+      const raw = logData?.data?.deploymentLogs || [];
+      const startMs = new Date(startDateIso).getTime();
+
+      // Filter by time window + grep + lead_id. All filters are case-insensitive.
+      const grepLower = grep ? String(grep).toLowerCase() : null;
+      const leadLower = lead_id ? String(lead_id).toLowerCase() : null;
+      const filtered = [];
+      for (const l of raw) {
+        const tsMs = new Date(l.timestamp).getTime();
+        if (Number.isFinite(tsMs) && tsMs < startMs) continue;
+        const msg = (l.message || '');
+        if (grepLower && !msg.toLowerCase().includes(grepLower)) continue;
+        if (leadLower && !msg.toLowerCase().includes(leadLower)) continue;
+        filtered.push(l);
+      }
+
+      // Sort ascending by timestamp.
+      filtered.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+
+      const truncated = filtered.length > limit;
+      // When truncating, prefer the most recent lines — they're the ones most
+      // likely to matter when investigating an incident.
+      const capped = truncated ? filtered.slice(-limit) : filtered;
+
+      const lines = capped.map(l => ({
+        timestamp: l.timestamp,
+        level: (l.severity || 'info').toLowerCase(),
+        message: l.message,
+      }));
+
+      return JSON.stringify({
+        service,
+        time_range,
+        matched: lines.length,
+        truncated,
+        lines,
+      }, null, 2);
     }
     default:
       return JSON.stringify({ error: `Unknown tool: ${name}` });
