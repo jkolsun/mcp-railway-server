@@ -7,7 +7,7 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install
 
-COPY server.js ./
+COPY server.js auth.js ./
 
 EXPOSE 8080
 

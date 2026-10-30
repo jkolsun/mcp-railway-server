@@ -1,10 +1,17 @@
 import express from 'express';
 import cors from 'cors';
 import crypto from 'crypto';
+import { createAuth, clientIp } from './auth.js';
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// 2026-10-30 — the SSE and message routes live on this router, which is
+// mounted only behind the secret (auth.js): at /k/<MCP_API_KEY>/… and, for a
+// client that sends Authorization: Bearer, at the bare paths. get-variables
+// returns every production secret, so this server must never answer bare.
+const mcp = express.Router();
 
 const PORT = process.env.PORT || 8080;
 const RAILWAY_TOKEN = process.env.RAILWAY_TOKEN;
@@ -317,16 +324,17 @@ const sessions = new Map();
 
 app.get('/healthz', (req, res) => res.send('ok'));
 
-app.get('/sse', (req, res) => {
+mcp.get('/sse', (req, res) => {
   const sessionId = crypto.randomUUID();
-  console.log(`[${sessionId}] New SSE connection`);
+  console.log(`[${sessionId}] New SSE connection from ${clientIp(req)}`);
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
   });
   sessions.set(sessionId, { res, initialized: false });
-  res.write(`event: endpoint\ndata: /message?sessionId=${sessionId}\n\n`);
+  // baseUrl keeps the client on the same authenticated prefix (/k/<key> or '').
+  res.write(`event: endpoint\ndata: ${req.baseUrl}/message?sessionId=${sessionId}\n\n`);
   const keepalive = setInterval(() => {
     try { res.write(': keepalive\n\n'); } catch (e) { clearInterval(keepalive); }
   }, 30000);
@@ -337,13 +345,13 @@ app.get('/sse', (req, res) => {
   });
 });
 
-app.post('/message', async (req, res) => {
+mcp.post('/message', async (req, res) => {
   const sessionId = req.query.sessionId;
   const session = sessions.get(sessionId);
   if (!session) return res.status(404).json({ error: 'Session not found' });
 
   const msg = req.body;
-  console.log(`[${sessionId}] Received: ${msg.method} id=${msg.id}`);
+  console.log(`[${sessionId}] Received: ${msg.method}${msg.params?.name ? ` ${msg.params.name}` : ''} id=${msg.id} from ${clientIp(req)}`);
   let response;
 
   if (msg.method === 'initialize') {
@@ -376,5 +384,12 @@ app.post('/message', async (req, res) => {
   }
   res.status(202).json({ status: 'accepted' });
 });
+
+const auth = createAuth();
+if (!auth.configured) {
+  console.error('[auth] MCP_API_KEY is not set (or shorter than 32 characters) — every MCP route answers 503 until it is (fail closed)');
+}
+app.use('/k/:key', auth.pathKey, mcp);
+app.use(auth.bearer, mcp);
 
 app.listen(PORT, () => console.log(`MCP Railway GraphQL server listening on port ${PORT}`));
