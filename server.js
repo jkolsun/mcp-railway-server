@@ -7,14 +7,16 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// 2026-10-30 — the SSE and message routes live on this router, which is
-// mounted only behind the secret (auth.js): at /k/<MCP_API_KEY>/… and, for a
-// client that sends Authorization: Bearer, at the bare paths. get-variables
-// returns every production secret, so this server must never answer bare.
+// 2026-10-30 — the MCP routes (streamable HTTP /mcp since 2026-11-05, plus SSE
+// /sse + /message) live on this router, which is mounted only behind the secret
+// (auth.js): at /k/<MCP_API_KEY>/… and, for a client that sends Authorization:
+// Bearer, at the bare paths. get-variables returns every production secret, so
+// this server must never answer bare.
 const mcp = express.Router();
 
 const PORT = process.env.PORT || 8080;
-const RAILWAY_TOKEN = process.env.RAILWAY_TOKEN;
+// Either name works (2026-11-05): the service has carried both.
+const RAILWAY_TOKEN = process.env.RAILWAY_TOKEN || process.env.RAILWAY_API_TOKEN;
 // Optional — required only for the get-logs tool, which resolves services by
 // name within a single pre-configured project. All other tools take explicit
 // projectId/serviceId/environmentId args and don't need these.
@@ -22,7 +24,7 @@ const RAILWAY_PROJECT_ID = process.env.RAILWAY_PROJECT_ID || null;
 const RAILWAY_ENVIRONMENT_NAME = process.env.RAILWAY_ENVIRONMENT_NAME || 'production';
 
 if (!RAILWAY_TOKEN) {
-  console.error('RAILWAY_TOKEN environment variable is required');
+  console.error('RAILWAY_TOKEN (or RAILWAY_API_TOKEN) environment variable is required');
   process.exit(1);
 }
 
@@ -324,6 +326,18 @@ const sessions = new Map();
 
 app.get('/healthz', (req, res) => res.send('ok'));
 
+// 2026-11-05 — no OAuth here: every /.well-known/* path is a clean 404 (never the
+// bearer guard's refusal), so claude.ai never tries a login. And a plain root page.
+app.all('/.well-known/*', (req, res) => res.status(404).end());
+app.get('/', (req, res) => res.status(200).type('text/plain').send('mcp-railway ok'));
+
+// Streamable HTTP session header must be allowed in and exposed out for browser clients.
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Headers', 'Authorization, Content-Type, mcp-session-id, mcp-protocol-version');
+  res.header('Access-Control-Expose-Headers', 'mcp-session-id');
+  next();
+});
+
 mcp.get('/sse', (req, res) => {
   const sessionId = crypto.randomUUID();
   console.log(`[${sessionId}] New SSE connection from ${clientIp(req)}`);
@@ -345,44 +359,92 @@ mcp.get('/sse', (req, res) => {
   });
 });
 
+// Protocol versions this server answers in kind; anything else gets the newest.
+const SUPPORTED_PROTOCOLS = ['2025-06-18', '2025-03-26', '2024-11-05'];
+
+/**
+ * One JSON-RPC message → its response, or null for a notification (no id) —
+ * shared by the SSE /message route and the streamable HTTP /mcp route, so both
+ * carry exactly the same tools.
+ */
+async function handleRpc(msg) {
+  const isNotification = msg == null || msg.id === undefined || msg.id === null;
+  if (!msg || typeof msg !== 'object' || msg.jsonrpc !== '2.0' || typeof msg.method !== 'string') {
+    return isNotification ? null : { jsonrpc: '2.0', id: msg.id, error: { code: -32600, message: 'Invalid Request' } };
+  }
+  if (msg.method.startsWith('notifications/')) return null;
+  if (msg.method === 'initialize') {
+    const asked = msg.params?.protocolVersion;
+    return {
+      jsonrpc: '2.0', id: msg.id,
+      result: {
+        protocolVersion: SUPPORTED_PROTOCOLS.includes(asked) ? asked : SUPPORTED_PROTOCOLS[0],
+        capabilities: { tools: {} },
+        serverInfo: { name: 'railway-graphql-mcp', version: '1.1.0' },
+      },
+    };
+  }
+  if (msg.method === 'ping') return { jsonrpc: '2.0', id: msg.id, result: {} };
+  if (msg.method === 'tools/list') return { jsonrpc: '2.0', id: msg.id, result: { tools: TOOLS } };
+  if (msg.method === 'tools/call') {
+    try {
+      const result = await handleToolCall(msg.params?.name, msg.params?.arguments || {});
+      return { jsonrpc: '2.0', id: msg.id, result: { content: [{ type: 'text', text: result }], isError: false } };
+    } catch (err) {
+      return { jsonrpc: '2.0', id: msg.id, result: { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true } };
+    }
+  }
+  if (isNotification) return null;
+  return { jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: `Method not found: ${msg.method}` } };
+}
+
 mcp.post('/message', async (req, res) => {
   const sessionId = req.query.sessionId;
   const session = sessions.get(sessionId);
   if (!session) return res.status(404).json({ error: 'Session not found' });
 
   const msg = req.body;
-  console.log(`[${sessionId}] Received: ${msg.method}${msg.params?.name ? ` ${msg.params.name}` : ''} id=${msg.id} from ${clientIp(req)}`);
-  let response;
-
-  if (msg.method === 'initialize') {
-    session.initialized = true;
-    response = {
-      jsonrpc: '2.0', id: msg.id,
-      result: {
-        protocolVersion: '2024-11-05',
-        capabilities: { tools: {} },
-        serverInfo: { name: 'railway-graphql-mcp', version: '1.0.0' },
-      },
-    };
-  } else if (msg.method === 'notifications/initialized') {
-    return res.status(202).json({ status: 'accepted' });
-  } else if (msg.method === 'tools/list') {
-    response = { jsonrpc: '2.0', id: msg.id, result: { tools: TOOLS } };
-  } else if (msg.method === 'tools/call') {
-    try {
-      const result = await handleToolCall(msg.params?.name, msg.params?.arguments || {});
-      response = { jsonrpc: '2.0', id: msg.id, result: { content: [{ type: 'text', text: result }], isError: false } };
-    } catch (err) {
-      response = { jsonrpc: '2.0', id: msg.id, result: { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true } };
-    }
-  } else {
-    response = { jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: `Method not found: ${msg.method}` } };
-  }
-
+  console.log(`[${sessionId}] Received: ${msg?.method}${msg?.params?.name ? ` ${msg.params.name}` : ''} id=${msg?.id} from ${clientIp(req)}`);
+  if (msg?.method === 'initialize') session.initialized = true;
+  const response = await handleRpc(msg);
   if (response) {
     session.res.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
   }
   res.status(202).json({ status: 'accepted' });
+});
+
+// ── Streamable HTTP (2026-11-05) — what claude.ai connectors speak. Stateless:
+// every POST carries one JSON-RPC message (or a batch) and gets plain JSON back;
+// notifications get 202. No session id, no stream to resume.
+mcp.post('/mcp', async (req, res) => {
+  try {
+    const body = req.body;
+    const batch = Array.isArray(body);
+    const msgs = batch ? body : [body];
+    for (const m of msgs) {
+      console.log(`[mcp] ${m?.method || '?'}${m?.params?.name ? ` ${m.params.name}` : ''} from ${clientIp(req)}`);
+    }
+    if (msgs.length === 0) {
+      return res.status(400).json({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Invalid Request' } });
+    }
+    const out = (await Promise.all(msgs.map(handleRpc))).filter(Boolean);
+    if (out.length === 0) return res.status(202).end();
+    res.status(200).json(batch ? out : out[0]);
+  } catch (err) {
+    console.error('MCP POST error:', err);
+    if (!res.headersSent) res.status(500).json({ jsonrpc: '2.0', id: null, error: { code: -32603, message: 'Internal error' } });
+  }
+});
+mcp.get('/mcp', (req, res) => {
+  res.status(405).set('Allow', 'POST').json({ error: 'Method not allowed in stateless mode' });
+});
+mcp.delete('/mcp', (req, res) => {
+  res.status(405).set('Allow', 'POST').json({ error: 'Method not allowed in stateless mode' });
+});
+// A POST to the SSE URL is a client probing for streamable HTTP: 405 + Allow: GET
+// says "SSE here, no auth to discover" (the mcp-postgres fix, 2026-09-17).
+mcp.post('/sse', (req, res) => {
+  res.status(405).set({ 'Allow': 'GET', 'Content-Type': 'text/plain' }).send('SSE endpoint: use GET');
 });
 
 const auth = createAuth();

@@ -42,7 +42,9 @@ export function createAuth(key = process.env.MCP_API_KEY) {
     const m = /^Bearer\s+(\S+)\s*$/i.exec(req.get('authorization') || '');
     if (m && matches(m[1])) return next();
     console.warn(`[auth] refused ${req.method} (no or bad bearer) from ${clientIp(req)}`);
-    res.status(401).set('WWW-Authenticate', 'Bearer').json({ error: 'unauthorized' });
+    // 2026-11-05: a plain 404, never 401 + WWW-Authenticate — a 401 makes claude.ai
+    // start an OAuth login this server does not have ('Couldn't register with … sign-in service').
+    res.status(404).end();
   }
 
   /** Middleware for routes mounted at /k/:key. A wrong key is a plain 404 (nothing to discover). */
